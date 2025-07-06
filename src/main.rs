@@ -1,520 +1,320 @@
-use rand::Rng;
+mod intel8080;
+mod shift_register;
+mod disassembler;
+mod display;
+
+mod audio;
+
+use std::{fs, thread};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::channel;
+use std::time::Instant;
+use sdl2::audio::{AudioCallback, AudioSpecDesired, AudioSpecWAV};
+use crate::disassembler::Disassembler;
+use crate::intel8080::Intel8080;
+use crate::shift_register::ShiftRegister;
 use sdl2::event::Event;
 use sdl2::keyboard::Scancode;
+use sdl2::libc::{printf, sleep, sprintf};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
-use sdl2::render::WindowCanvas;
-use std::fs;
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
-use std::{env, thread};
-// use sdl2::audio::{AudioCallback, AudioSpecDesired};
+use sdl2::render::{TextureQuery, WindowCanvas};
+use sdl2::ttf::Sdl2TtfContext;
+use sdl2::mixer::{Chunk, Channel, AUDIO_S16LSB, DEFAULT_CHANNELS};
+use crate::audio::MySdl2Audio;
 
-// fn display(display_data: &[[bool; 64]; 32]) {
-//     display_data.iter().for_each(|i| {
-//         i.iter().for_each(|j| {
-//             print!("{}", if *j { "██" } else { "  " });
-//         });
-//         print!("\n")
-//     });
-// }
+const VIDEO_WIDTH: usize = 256;
+const VIDEO_HEIGHT: usize = 224;
+const VIDEO_SCALE: u32 = 5;
+const REFRESH_RATE: u32 = 60;
 
-fn display_canvas(display_data: &[[bool; 64]; 32], scale: u32, canvas: &mut WindowCanvas) {
+struct Playback {
+    data: Arc<Mutex<Vec<u8>>>,
+    pos: usize,
+}
+
+impl AudioCallback for Playback {
+    type Channel = u8;
+
+    fn callback(&mut self, out: &mut [u8]) {
+        let data = self.data.lock().unwrap();
+        let end = (self.pos + out.len()).min(data.len());
+        let slice = &data[self.pos..end];
+        out[..slice.len()].copy_from_slice(slice);
+        self.pos += slice.len();
+    }
+}
+
+fn sound(port:u8,data:u8,prev_data:u8,audio:&MySdl2Audio) {
+    match port {
+        3=>{
+            if (data & 1) == 1 && prev_data & 1 == 0 {
+                audio.play_ufo()
+            }
+            if (data & 1) == 0 && prev_data & 1 == 1 {
+                audio.stop_ufo()
+            }
+            if (data & 2) == 2 && prev_data & 2 == 0 {
+                audio.play_shoot()
+            }
+            if (data & 2) == 0 && prev_data & 2 == 2 {
+                audio.stop_shoot()
+            }
+            if (data & 4) == 4 && prev_data & 4 == 0 {
+                audio.play_player_die()
+            }
+            if (data & 8) == 8 && prev_data & 8 == 0 {
+                audio.play_invader_die()
+            }
+        },
+        5=>{
+            if (data & 1) == 1 && prev_data & 1 == 0 {
+                audio.play_fleet_movement_1()
+            }
+            if (data & 2) == 2 && prev_data & 2 == 0 {
+                audio.play_fleet_movement_2()
+            }
+            if (data & 4) == 4 && prev_data & 4 == 0 {
+                audio.play_fleet_movement_3()
+            }
+            if (data & 8) == 8 && prev_data & 8 == 0 {
+                audio.play_fleet_movement_4()
+            }
+            if (data & 16) == 16 && prev_data & 16 == 0 {
+                audio.play_ufo_hit()
+            }
+        }
+        _ => {}
+    }
+}
+
+fn map_scancode_to_inputs_enable(scancode: Scancode, inputs: &mut Inputs){
+    match scancode {
+        Scancode::A =>inputs.p1left = true,
+        Scancode::D =>inputs.p1right = true,
+        Scancode::F => inputs.p1shoot = true,
+        Scancode::G => inputs.p1start = true,
+        Scancode::C => inputs.coin = true,
+        Scancode::T => inputs.p2start = true,
+        Scancode::Left => inputs.p2left = true,
+        Scancode::Right => inputs.p2right = true,
+        Scancode::Slash => inputs.p2shoot = true,
+        _ => {}
+    }
+}
+
+fn map_scancode_to_inputs_disable(scancode: Scancode, inputs: &mut Inputs){
+    match scancode {
+        Scancode::A =>inputs.p1left = false,
+        Scancode::D =>inputs.p1right = false,
+        Scancode::F => inputs.p1shoot = false,
+        Scancode::G => inputs.p1start = false,
+        Scancode::C => inputs.coin = false,
+        Scancode::T => inputs.p2start = false,
+        Scancode::Left => inputs.p2left = false,
+        Scancode::Right => inputs.p2right = false,
+        Scancode::Slash => inputs.p2shoot = false,
+        _ => {}
+    }
+}
+
+struct Inputs {
+    p2start: bool,
+    p1start: bool,
+    p1shoot: bool,
+    p1left: bool,
+    p1right: bool,
+    p2shoot: bool,
+    p2left: bool,
+    p2right: bool,
+    coin: bool,
+}
+
+impl Inputs {
+    fn new() -> Inputs {
+        Inputs{
+            p2start:false,
+            p1start: false,
+            p1shoot: false,
+            p1left: false,
+            p1right: false,
+            p2shoot: false,
+            p2left: false,
+            p2right: false,
+            coin: false,
+        }
+    }
+}
+
+fn input0(inputs: &Inputs) ->u8{
+    let mut result = 0b00001110;
+    if inputs.p1shoot {result |= 1<<4} else {result &= !(1<<4)};
+    if inputs.p1left {result |= 1<<5} else {result &= !(1<<5)};
+    if inputs.p1right {result |= 1<<6} else {result &= !(1<<6)};
+    result
+}
+
+
+fn input1(inputs: &Inputs)->u8{
+    let mut result = 0b00001000;
+    if inputs.coin{result|=1} else  {result &= !(1)};
+    if inputs.p2start {result |= 1<<1} else {result &= !(1<<1)};
+    if inputs.p1start {result |= 1<<2} else {result &= !(1<<2)};
+    if inputs.p1shoot {result |= 1<<4} else {result &= !(1<<4)};
+    if inputs.p1left {result |= 1<<5} else {result &= !(1<<5)};
+    if inputs.p1right {result |= 1<<6} else {result &= !(1<<6)};
+    result
+}
+fn input2(inputs: &Inputs)->u8 {
+    let mut result = 0b00000011;
+    if inputs.p2shoot {result |= 1<<4} else {result &= !(1<<4)};
+    if inputs.p2left {result |= 1<<5} else {result &= !(1<<5)};
+    if inputs.p2right {result |= 1<<6} else {result &= !(1<<6)};
+    result
+}
+
+pub fn display_canvas(display_data: &[u8; VIDEO_WIDTH * VIDEO_HEIGHT / 8], scale: u32, canvas: &mut WindowCanvas) {
     canvas.set_draw_color(Color::RGB(0, 0, 0));
     canvas.clear();
     canvas.set_draw_color(Color::RGB(255, 255, 255));
-    for (y, row) in display_data.iter().enumerate() {
-        for (x, elem) in row.iter().enumerate() {
-            if *elem {
+    for (index, byte) in display_data.iter().enumerate() {
+        let mut byte_arr:[u8;8] = [0;8];
+        for n in 0..8 {
+            let bit = (byte & (0b01 << n))>>(n) ;
+
+            let total_index = 8 * index + n;
+            let x = total_index % 256;
+            let y = total_index / 256;
+            let rotated_x = y;
+            let rotated_y = VIDEO_WIDTH - x;
+
+            if bit == 1 {
                 let rect = Rect::new(
-                    (x as u32 * scale) as i32,
-                    (y as u32 * scale) as i32,
+                    (rotated_x as u32 * scale) as i32,
+                    ((rotated_y) as u32 * scale) as i32,
                     scale,
                     scale,
                 );
                 canvas.fill_rect(rect).unwrap();
             }
         }
+
     }
     canvas.present();
 }
 
-fn map_scancode_to_chip8(scancode: Scancode) -> Option<u8> {
-    match scancode {
-        Scancode::Num1 => Some(0x1),
-        Scancode::Num2 => Some(0x2),
-        Scancode::Num3 => Some(0x3),
-        Scancode::Num4 => Some(0xC),
-        Scancode::Q => Some(0x4),
-        Scancode::W => Some(0x5),
-        Scancode::E => Some(0x6),
-        Scancode::R => Some(0xD),
-        Scancode::A => Some(0x7),
-        Scancode::S => Some(0x8),
-        Scancode::D => Some(0x9),
-        Scancode::F => Some(0xE),
-        Scancode::Z => Some(0xA),
-        Scancode::X => Some(0x0),
-        Scancode::C => Some(0xB),
-        Scancode::V => Some(0xF),
-        _ => None,
-    }
-}
-
 fn main() -> Result<(), String> {
-    let args: Vec<String> = env::args().collect();
-    println!("{:?}", args);
-    struct Quirks {
-        shift: bool,
-        memory_increment_by_x: bool,
-        memory_leave_unchanged: bool,
-        wrap: bool,
-        jump: bool,
-        // vblank:bool, // not implemented
-        logic: bool,
-    }
-
-    let original_chip_8 = Quirks {
-        shift: false,
-        memory_increment_by_x: false,
-        memory_leave_unchanged: false,
-        wrap: false,
-        jump: false,
-        // vblank: false,
-        logic: true,
-    };
-
-    // Scrolling instruction not implemented
-    // let legacy_superchip = Quirks{
-    //     shift:true,
-    //     memory_increment_by_x:false,
-    //     memory_leave_unchanged: true,
-    //     wrap: false,
-    //     jump: true,
-    //     vblank: false,
-    //     logic: false,
-    // };
-
-    let current_quirks = original_chip_8;
-
-    const VIDEO_WIDTH: usize = 64;
-    const VIDEO_HEIGHT: usize = 32;
-    const VIDEO_SCALE: u32 = 10;
-    const CYCLE_SPEED: usize = 500;
-    const PERIOD: f64 = 1.0 / (CYCLE_SPEED as f64);
-
-    const FONT_SET_START_ADDRESS: usize = 0x050;
 
     let sdl_context = sdl2::init()?;
     let video = sdl_context.video()?;
-    // let audio_subsystem = sdl_context.audio()?;
+    let audio_subsystem = sdl_context.audio()?;
     let window = video
         .window(
-            "CHIP-8 Emulator",
-            (VIDEO_WIDTH as u32) * VIDEO_SCALE,
+            "Intel 8080 Emulator",
             (VIDEO_HEIGHT as u32) * VIDEO_SCALE,
+            (VIDEO_WIDTH as u32) * VIDEO_SCALE,
         )
         .position_centered()
         .build()
         .map_err(|e| e.to_string())?;
     let mut canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
     let mut event_pump = sdl_context.event_pump()?;
-    let mut chip8_keys = [false; 16]; // CHIP-8 key state
 
-    // 0x000-0x1FF - Chip 8 interpreter (contains font set in emu)
-    // 0x050-0x0A0 - Used for the built in 4x5 pixel font set (0-F)
-    // 0x200-0xFFF - Program ROM and work RAM
-    let mut memory: [u8; 4096] = [0; 4096];
-    let mut pc: u16 = 0x200;
-    let mut registers: [u8; 16] = [0; 16];
-    let mut I: u16 = 0;
-    let mut stack: Vec<u16> = Vec::new();
+    // let wav_spec = AudioSpecWAV::load_wav("samples/0.wav").expect("Failed to load sample file");
+    // let data = Arc::new(Mutex::new(wav_spec.buffer().to_vec()));
+    // let desired_spec = AudioSpecDesired {
+    //     freq: Some(wav_spec.freq),
+    //     channels: Some(wav_spec.channels),
+    //     samples: None,
+    // };
+    // let device = audio_subsystem.open_playback(None, &desired_spec, |_| Playback {
+    //     data: data.clone(),
+    //     pos: 0,
+    // })?;
+    
+    // let frequency = 44_100;
+    // let format = AUDIO_S16LSB; // signed 16 bit samples, in little-endian byte order
+    // let channels = 8;
+    // let chunk_size = 1_024;
+    // sdl2::mixer::open_audio(frequency, format, channels, chunk_size)?;
+    // 
+    // // Start playback
+    // let chunk = Chunk::from_file("samples/1.wav")?;
+    // Channel(7).play(&chunk, 0).unwrap();
+    
+    let audio = MySdl2Audio::new(
+        &fs::read("samples/0.wav").unwrap() ,
+        &fs::read("samples/1.wav").unwrap(),
+        &fs::read("samples/2.wav").unwrap(),
+        &fs::read("samples/3.wav").unwrap(),
+        &fs::read("samples/4.wav").unwrap(),
+        &fs::read("samples/5.wav").unwrap(),
+        &fs::read("samples/6.wav").unwrap(),
+        &fs::read("samples/7.wav").unwrap(),
+        &fs::read("samples/8.wav").unwrap(),
+        &fs::read("samples/9.wav").unwrap(),
+    );
 
-    static FONT_SET: [u8; 80] = [
-        0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
-        0x20, 0x60, 0x20, 0x20, 0x70, // 1
-        0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
-        0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
-        0x90, 0x90, 0xF0, 0x10, 0x10, // 4
-        0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
-        0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
-        0xF0, 0x10, 0x20, 0x40, 0x40, // 7
-        0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
-        0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
-        0xF0, 0x90, 0xF0, 0x90, 0x90, // A
-        0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
-        0xF0, 0x80, 0x80, 0x80, 0xF0, // C
-        0xE0, 0x90, 0x90, 0x90, 0xE0, // D
-        0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
-        0xF0, 0x80, 0xF0, 0x80, 0x80, // F
-    ];
-    // load fonts
-    for n in 0..FONT_SET.len() {
-        memory[FONT_SET_START_ADDRESS + n] = FONT_SET[n];
-    }
+    // let ttf_context = sdl2::ttf::init().map_err(|e| e.to_string())?;
+    // let font_path = Path::new("/usr/share/fonts/open-sans/OpenSans-Regular.ttf");
+    // let font = ttf_context.load_font(font_path, 24)?;
+    // let texture_creator = canvas.texture_creator();
 
-    let mut display_data: [[bool; 64]; 32] = [[false; 64]; 32];
-    let path = match env::args().nth(1) {
-        Some(path) => path,
-        None => return Err("No path specified".to_string()),
-    };
+    let mut shift_register = ShiftRegister::new();
 
-    let data = fs::read(path).expect("Unable to read file");
-    for n in 0..data.len() {
-        memory[0x200 + n] = data[n];
-    }
-    // for n in 0..(data.len())/2 {
-    //     let num = u16::from_be_bytes([data[2*n],data[(2*n)+1]]);
-    //     print!("{:X}{:X} {:04X}\n", data[2*n],data[(2*n)+1],num);
-    // }
 
-    let delay_timer = Arc::new(AtomicU8::new(0));
-    let timer_clone = Arc::clone(&delay_timer);
+    let mut intel8080 = Intel8080::new();
+    let prog = fs::read("cpu_tests/invaders.concatenated").expect("Unable to read file");
+    // let mut zeroes = vec![0u8; 0x100];
+    // zeroes.extend(prog);
+    // zeroes[0] = 0b11000011;
+    // zeroes[1] = 0x00;
+    // zeroes[2] = 0x01;
+    intel8080.load_program(prog);
 
-    let sound_timer = Arc::new(AtomicU8::new(0));
-    let sound_timer_clone = Arc::clone(&sound_timer);
+    let begin = Instant::now();
+    let mut last_interrupt = Instant::now();
+    let mut count = 0;
+    let mut count_interrupt = 1;
+    let mut countp = 0;
+    struct Avg{avg:f64,n:usize};
+    let mut avg_time = Avg{avg: 0.0,n:0};
+    let mut inputs = Inputs::new();
+    let mut prev_port3:u8=0;
+    let mut prev_port5:u8=0;
 
-    thread::spawn(move || {
-        loop {
-            let current = timer_clone.load(Ordering::Relaxed);
-            let sound = sound_timer_clone.load(Ordering::Relaxed);
-            if current > 0 {
-                timer_clone.store(current - 1, Ordering::Relaxed);
-            }
-            if sound > 0 {
-                sound_timer_clone.store(sound - 1, Ordering::Relaxed);
-                print!("beep {}", '\x07');
-                std::io::stdout().flush().unwrap();
-            } else {
-            }
-            thread::sleep(Duration::from_millis(1000 / 60)); // 60 Hz
-        }
-    });
-
+    // Render text to a surface, then to a texture
+    // let surface = font
+    //     .render(&format!("Cycles: {} Program counter: {} Clock speed: {}",intel8080.total_cycle, intel8080.PC,intel8080.total_cycle as f64 / begin.elapsed().as_secs_f64()))
+    //     .blended(Color::WHITE)
+    //     .map_err(|e| e.to_string())?;
+    // let texture = texture_creator
+    //     .create_texture_from_surface(&surface)
+    //     .map_err(|e| e.to_string())?;
+    //
+    // let TextureQuery { width, height, .. } = texture.query();
+    //
+    // // Position for text
+    // let target = Rect::new(100, 100, width, height);
+    //
+    // // canvas.set_draw_color(Color::BLACK);
+    // // canvas.clear();
+    // // canvas.copy(&texture, None, Some(target))?;
+    // // canvas.present();
     'main_loop: loop {
-        let start_time = Instant::now();
-        // fetch
-        let instruction: u16 = u16::from_be_bytes([memory[pc as usize], memory[(pc + 1) as usize]]);
-        // println!("{:04X?}", instruction);
-        std::io::stdout().flush().unwrap();
+        intel8080.cycle();
+        if intel8080.oport.len() > 0 {
+            let (port, data) = intel8080.oport.pop().unwrap();
+            match port {
+                2 => shift_register.write_offset(data),
+                3 => {sound(port,data,prev_port3,&audio);prev_port3 = data;},
+                4 => shift_register.insert(data),
+                5 => {sound(port,data,prev_port5,&audio);prev_port5 = data;},
 
-        pc += 2;
-        let i1: usize = (instruction >> 12) as usize;
-        let i2: usize = ((instruction & 0x0F00) >> 8) as usize;
-        let i3: usize = ((instruction & 0x00F0) >> 4) as usize;
-        let i4: usize = ((instruction & 0x000F) >> 0) as usize;
-        let nn: usize = (instruction & 0x00FF) as usize;
-        let nnn: usize = (instruction & 0x0FFF) as usize;
-
-        // decode
-        match i1 {
-            0 => {
-                if i2 == 0 && i3 == 0xE && i4 == 0x0 {
-                    display_data
-                        .iter_mut()
-                        .for_each(|row| row.iter_mut().for_each(|l| *l = false));
-                    display_canvas(&display_data, VIDEO_SCALE, &mut canvas);
-                } else if i2 == 0 && i3 == 0xE && i4 == 0xE {
-                    pc = stack.pop().unwrap_or_else(|| 0)
-                }
-            }
-            1 => {
-                // let address: u16 = instruction & 0x0FFF;
-                pc = nnn as u16;
-            }
-            2 => {
-                // let address: u16 = instruction & 0x0FFF;
-                stack.push(pc);
-                pc = nnn as u16;
-            }
-            3 => {
-                let byte: u8 = (instruction & 0x00FF) as u8;
-                if registers[i2] == byte {
-                    pc += 2;
-                }
-            }
-            4 => {
-                let byte: u8 = (instruction & 0x00FF) as u8;
-                if registers[i2] != byte {
-                    pc += 2;
-                }
-            }
-            5 => {
-                if i4 == 0 && registers[i2] == registers[i3] {
-                    pc += 2
-                }
-            }
-            6 => {
-                let byte: u8 = (instruction & 0x00FF) as u8;
-                registers[i2] = byte;
-            }
-            7 => {
-                let byte: u8 = (instruction & 0x00FF) as u8;
-                registers[i2] = registers[i2].wrapping_add(byte);
-            }
-            8 => {
-                match i4 {
-                    0 => registers[i2] = registers[i3],
-                    1 => {
-                        registers[i2] |= registers[i3];
-                        if current_quirks.logic {
-                            registers[0xF] = 0;
-                        }
-                    }
-                    2 => {
-                        registers[i2] &= registers[i3];
-                        if current_quirks.logic {
-                            registers[0xF] = 0;
-                        }
-                    }
-                    3 => {
-                        registers[i2] ^= registers[i3];
-                        if current_quirks.logic {
-                            registers[0xF] = 0;
-                        }
-                    }
-                    4 => {
-                        let mut sum: u16 = (registers[i2] as u16) + (registers[i3] as u16);
-                        if sum > 0xFF {
-                            sum = sum - 0x100;
-                            registers[i2] = sum as u8;
-                            registers[0xF] = 1;
-                        } else {
-                            registers[i2] = sum as u8;
-                            registers[0xF] = 0;
-                        }
-                    }
-                    5 => {
-                        // flag
-                        let temp = registers[i2];
-                        registers[i2] = registers[i2].wrapping_sub(registers[i3]);
-                        // if (temp == 20 && registers[i3]==15) {
-                        //     print!("Subtract 20-15 result {}", temp);
-                        // }
-                        if temp >= registers[i3] {
-                            registers[0xF] = 1;
-                        } else {
-                            registers[0xF] = 0;
-                        }
-                    }
-                    6 => {
-                        let temp = registers[i2];
-                        if current_quirks.shift {
-                            registers[i2] >>= 1;
-                            registers[0xF] = temp & 0x1;
-                        } else {
-                            registers[i2] = registers[i3] >> 1;
-                            registers[0xF] = registers[i3] & 0x1;
-                        }
-                    }
-                    7 => {
-                        // flag
-                        let temp = registers[i2];
-                        registers[i2] = registers[i3].wrapping_sub(registers[i2]);
-                        if registers[i3] >= temp {
-                            registers[0xF] = 1;
-                        } else {
-                            registers[0xF] = 0;
-                        }
-                    }
-                    0xE => {
-                        let temp = registers[i2];
-                        if current_quirks.shift {
-                            registers[i2] <<= 1;
-                            registers[0xF] = (temp & 0x80) >> 7;
-                        } else {
-                            registers[i2] = registers[i3] << 1;
-                            registers[0xF] = (registers[i3] & 0x80) >> 7;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            9 => {
-                if i4 == 0 {
-                    if registers[i2] != registers[i3] {
-                        pc += 2;
-                    }
-                }
-            }
-            0xA => {
-                // let address: u16 = instruction & 0x0FFF;
-                I = nnn as u16;
-            }
-            0xB => {
-                // let address: u16 = instruction & 0x0FFF;
-                if current_quirks.jump {
-                    pc = (registers[i2] as u16) + nnn as u16;
-                } else {
-                    pc = (registers[0] as u16) + nnn as u16;
-                }
-            }
-            0xC => {
-                let byte: u8 = (instruction & 0x00FF) as u8;
-                let mut rng = rand::rng();
-                let rand_byte: u8 = rng.random();
-                registers[i2] = rand_byte & byte;
-            }
-            0xD => {
-                let x_pos = registers[i2] % (VIDEO_WIDTH as u8);
-                let y_pos = registers[i3] % (VIDEO_HEIGHT as u8);
-                println!("printing sprite {} {}", x_pos, y_pos);
-                let height: u8 = i4 as u8;
-                registers[0xF] = 0;
-                for row in 0..height {
-                    let sprite_byte: u8 = memory[(I + row as u16) as usize];
-                    for col in 0..8 {
-                        let sprite_pixel: u8 = ((sprite_byte) & (0b10000000 >> col)) >> (7 - col);
-                        let is_sprite_pixel_on: bool =
-                            if sprite_pixel == 0x01 { true } else { false };
-
-                        let mut clipped: bool = false;
-                        let mut final_x_pos: usize = (x_pos + col) as usize;
-                        if final_x_pos < 0 as usize || final_x_pos >= VIDEO_WIDTH {
-                            clipped = true;
-                        }
-
-                        let mut final_y_pos: usize = (y_pos + row) as usize;
-                        if final_y_pos < 0 as usize || final_y_pos >= VIDEO_HEIGHT {
-                            clipped = true;
-                        }
-
-                        if current_quirks.wrap {
-                            final_x_pos %= VIDEO_WIDTH;
-                            final_y_pos %= VIDEO_HEIGHT;
-                            clipped = false;
-                        }
-
-                        if clipped {
-                            println!("display clipped");
-                            continue;
-                        }
-
-                        let screen_pixel = display_data[final_y_pos][final_x_pos];
-                        if is_sprite_pixel_on {
-                            if screen_pixel {
-                                registers[0xF] = 1;
-                            }
-                            display_data[final_y_pos][final_x_pos] ^= true;
-                        }
-                    }
-                }
-                display_canvas(&display_data, VIDEO_SCALE, &mut canvas);
-            }
-            0xE => {
-                let key: usize = registers[i2] as usize;
-                if i3 == 9 && i4 == 0xE {
-                    if chip8_keys[key] {
-                        pc += 2;
-                        println!("Passed! key {} detected", key);
-                        std::io::stdout().flush().unwrap();
-                    } else {
-                        // println!("Failed! key {} not detected", key);
-                        // std::io::stdout().flush().unwrap();
-                    }
-                }
-                if i3 == 0xA && i4 == 1 {
-                    if !chip8_keys[key] {
-                        pc += 2;
-                        println!("Passed! key {} not detected", key);
-                        std::io::stdout().flush().unwrap();
-                    } else {
-                        // println!("Failed! key {} detected", key);
-                        // std::io::stdout().flush().unwrap();
-                    }
-                }
-            }
-            0xF => {
-                if i3 == 0 && i4 == 7 {
-                    registers[i2] = delay_timer.load(Ordering::Relaxed);
-                }
-                if i3 == 0 && i4 == 0xA {
-                    let mut key_pressed = false;
-                    for n in 0..chip8_keys.len() {
-                        if chip8_keys[n] {
-                            print!("{} detected!", n);
-                            std::io::stdout().flush().unwrap();
-                            registers[i2] = n as u8;
-                            key_pressed = true;
-                            let mut holding = key_pressed;
-                            while holding {
-                                for event in event_pump.poll_iter() {
-                                    match event {
-                                        Event::KeyUp {
-                                            scancode: Some(scancode),
-                                            ..
-                                        } => {
-                                            if let Some(chip8_key) = map_scancode_to_chip8(scancode)
-                                            {
-                                                chip8_keys[chip8_key as usize] = false;
-                                                holding = false;
-                                                println!("Key {} released", chip8_key);
-                                                std::io::stdout().flush().unwrap();
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !key_pressed {
-                        println!("no key");
-                        std::io::stdout().flush().unwrap();
-                        pc -= 2;
-                    }
-                }
-                if i3 == 1 && i4 == 5 {
-                    delay_timer.store(registers[i2], Ordering::Relaxed);
-                }
-                if i3 == 1 && i4 == 8 {
-                    sound_timer.store(registers[i2], Ordering::Relaxed);
-                }
-                if i3 == 1 && i4 == 0xE {
-                    I += registers[i2] as u16;
-                }
-                if i3 == 2 && i4 == 9 {
-                    let digit = registers[i2];
-                    I = (FONT_SET_START_ADDRESS as u16) + ((5 * digit) as u16);
-                }
-                if i3 == 3 && i4 == 3 {
-                    let mut value = registers[i2];
-                    memory[(I + 2) as usize] = value % 10;
-                    value /= 10;
-                    memory[(I + 1) as usize] = value % 10;
-                    value /= 10;
-                    memory[(I + 0) as usize] = value % 10;
-                }
-                if i3 == 5 && i4 == 5 {
-                    for n in 0..i2 + 1 {
-                        memory[(I as usize) + n] = registers[n];
-                    }
-                    if current_quirks.memory_increment_by_x {
-                        I += i2 as u16;
-                    } else if !current_quirks.memory_leave_unchanged {
-                        I += i2 as u16;
-                        I += 1;
-                    }
-                }
-                if i3 == 6 && i4 == 5 {
-                    for n in 0..i2 + 1 {
-                        registers[n] = memory[(I as usize) + n];
-                    }
-
-                    if current_quirks.memory_increment_by_x {
-                        I += i2 as u16;
-                    } else if !current_quirks.memory_leave_unchanged {
-                        I += i2 as u16;
-                        I += 1;
-                    }
-                }
-            }
-            _ => {
-                print!("invalid instruction");
-                break;
+                _ => {}
             }
         }
 
@@ -526,35 +326,59 @@ fn main() -> Result<(), String> {
                     scancode: Some(scancode),
                     ..
                 } => {
-                    if let Some(chip8_key) = map_scancode_to_chip8(scancode) {
-                        if !chip8_keys[chip8_key as usize] {
-                            print!("beep {}", '\x07');
-                            // device.resume();
-                            chip8_keys[chip8_key as usize] = true;
-                            println!("Key {} pressed", chip8_key);
-                        }
-                        std::io::stdout().flush().unwrap();
-                    }
+                    map_scancode_to_inputs_enable(scancode, &mut inputs);
                 }
 
                 Event::KeyUp {
                     scancode: Some(scancode),
                     ..
                 } => {
-                    if let Some(chip8_key) = map_scancode_to_chip8(scancode) {
-                        chip8_keys[chip8_key as usize] = false;
-                        println!("Key {} released", chip8_key);
-                        // device.pause();
-                    }
+                    map_scancode_to_inputs_disable(scancode, &mut inputs);
                 }
 
                 _ => {}
             }
         }
-        let time_taken = Instant::now().duration_since(start_time);
-        if time_taken.as_secs_f64() < PERIOD {
-            sleep(Duration::from_secs_f64(PERIOD - time_taken.as_secs_f64()));
+        intel8080.iport[0] = input0(&inputs);
+        intel8080.iport[1] = input1(&inputs);
+        intel8080.iport[2] = input2(&inputs);
+        intel8080.iport[3] = shift_register.result();
+
+        if (intel8080.total_ticks >33333*count as usize) {
+            count += 1;
+            // println!("display");
+            let display_data = &intel8080.memory[0x2400..=0x3FFF];
+            // for data in display_data {
+            //     if *data != 0 {
+            //         println!("Display data exist!!! {}",*data);
+            //     }
+            // }
+            display_canvas(display_data.try_into().expect(""),VIDEO_SCALE,&mut canvas);
+            intel8080.interrupt_data.push(0b11010111);
         }
+
+        if (intel8080.total_ticks > 1000000*countp as usize){
+            countp+=1;
+            // println!("{}", intel8080.total_ticks as f32 / begin.elapsed().as_secs_f32());
+        }
+
+        if intel8080.total_ticks >16666*count_interrupt && intel8080.interrupt_enabled {
+            count_interrupt += 2;
+            avg_time.avg = (avg_time.avg * avg_time.n as f64 + last_interrupt.elapsed().as_secs_f64()) / (avg_time.n+1) as f64;
+            avg_time.n += 1;
+            // println!("Avg: {}", avg_time.avg);
+            intel8080.interrupt_data.push(0b11001111);
+            last_interrupt = Instant::now();
+        }
+
+        intel8080.last_cycle_time = Instant::now();
+        //
+        // if (intel8080.total_ticks>100000){
+        //     break;
+        // }
+
+        // port_operations(&mut intel8080);
     }
+
     Ok(())
 }

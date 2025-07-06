@@ -1,8 +1,6 @@
-# CHIP-8 Emulator
+# Intel 8080 Emulator
 
-![A screenshot of the emulator](./screenshot.png)
-
-A CHIP-8 Emulator written in Rust.
+An Intel 8080 emulator written in Rust
 
 ## Usage
 

@@ -1,8 +1,6 @@
 mod intel8080;
 mod shift_register;
 mod disassembler;
-mod display;
-
 mod audio;
 
 use std::{fs, thread};
@@ -23,7 +21,7 @@ use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::render::{TextureQuery, WindowCanvas};
 use sdl2::ttf::Sdl2TtfContext;
-use sdl2::mixer::{Chunk, Channel, AUDIO_S16LSB, DEFAULT_CHANNELS};
+use sdl2::mixer::{Chunk, Channel, AUDIO_S16LSB, DEFAULT_CHANNELS, InitFlag};
 use crate::audio::MySdl2Audio;
 
 const VIDEO_WIDTH: usize = 256;
@@ -234,17 +232,19 @@ fn main() -> Result<(), String> {
     //     data: data.clone(),
     //     pos: 0,
     // })?;
-    
+
     // let frequency = 44_100;
     // let format = AUDIO_S16LSB; // signed 16 bit samples, in little-endian byte order
     // let channels = 8;
     // let chunk_size = 1_024;
     // sdl2::mixer::open_audio(frequency, format, channels, chunk_size)?;
-    // 
-    // // Start playback
+    // sdl2::mixer::init(InitFlag::MID);
+    // sdl2::mixer::allocate_channels(channels);
+    
+    // Start playback
     // let chunk = Chunk::from_file("samples/1.wav")?;
     // Channel(7).play(&chunk, 0).unwrap();
-    
+
     let audio = MySdl2Audio::new(
         &fs::read("samples/0.wav").unwrap() ,
         &fs::read("samples/1.wav").unwrap(),

@@ -20,7 +20,6 @@ use sdl2::libc::{printf, sleep, sprintf};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::render::{TextureQuery, WindowCanvas};
-use sdl2::ttf::Sdl2TtfContext;
 use sdl2::mixer::{Chunk, Channel, AUDIO_S16LSB, DEFAULT_CHANNELS, InitFlag};
 use crate::audio::MySdl2Audio;
 

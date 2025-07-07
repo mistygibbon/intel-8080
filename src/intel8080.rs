@@ -6,9 +6,9 @@ use spin_sleep::SpinSleeper;
 
 const PROGRAM_START_ADDRESS: usize = 0x0;
 
-const CLOCK_SPEED:usize = 2000000;
-const PERIOD:f64 = 1.0 / (CLOCK_SPEED as f64);
-const PERIOD_NS:usize = 350;
+// const CLOCK_SPEED:usize = 2000000;
+// const PERIOD:f64 = 1.0 / (CLOCK_SPEED as f64);
+const PERIOD_NS:usize = 350; // should be 500, but 350 works to get 2MHz
 
 pub trait IOHandler {
     fn input(&mut self, port: u8) -> u8;
